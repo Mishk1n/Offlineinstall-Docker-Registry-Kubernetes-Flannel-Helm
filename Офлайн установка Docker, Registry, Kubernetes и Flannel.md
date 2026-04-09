@@ -187,7 +187,7 @@ cd all-offline-*
 chmod +x install-worker-auto.sh
 
 # Запустите с параметрами
-./install-worker-auto.sh 5.42.106.202 'kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>'
+./install-worker-auto.sh <master-ip> 'kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>'
 ```
 
 ## 📌 Что делает скрипт worker узла
@@ -254,7 +254,7 @@ systemctl restart containerd docker kubelet
 ### Если IP всё равно не определяется - укажите вручную
 ```bash
 # Вручную задайте IP перед запуском
-export MASTER_IP="5.42.106.202"
+export MASTER_IP="<master-ip>"
 ```
 Или измените скрипт - добавьте ручной ввод
 ```bash
