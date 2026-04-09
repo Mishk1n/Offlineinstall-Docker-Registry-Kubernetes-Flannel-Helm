@@ -38,6 +38,7 @@ all-offline-YYYYMMDD/
 └── install-all.sh     # Главный установочный скрипт
 ```
 ## 🚀 Предварительная подготовка
+Этап 0: Подготовка на машине с интернетом
 ```bash
 # Добавление официального репозитория docker
 dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
