@@ -1,4 +1,8 @@
 # Офлайн установка Docker, Registry, Kubernetes и Flannel
+
+## Work on script in progress. fails on kube install. Tested on vm.
+## RedOS 8 not supported yet. glibc 2.36 crictl error. AlmaLinux glibc3.29
+
 ## 📋 Описание
 Данный набор скриптов позволяет выполнить полную офлайн установку следующих компонентов на сервер без доступа к интернету:
 | Компонент | Версия |
