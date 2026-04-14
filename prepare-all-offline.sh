@@ -1,7 +1,7 @@
 #!/bin/bash
 # prepare-all-offline.sh
 # Запустить на машине с доступом в интернет
-# Создаёт полный офлайн пакет: Docker + Compose + Registry + K8s + Flannel
+# Создаёт полный офлайн пакет: Docker + Registry + K8s + Flannel + Worker поддержка
 
 set -e
 
@@ -14,7 +14,6 @@ FLANNEL_CNI_VERSION="v1.6.0-flannel1"
 DOCKER_COMPOSE_VERSION="v2.29.7"
 CNI_PLUGINS_VERSION="v1.6.2"
 CRICTL_VERSION="v1.33.0"
-CONTAINERD_VERSION="1.7.27"
 ARCH="amd64"
 WORK_DIR="/tmp/all-offline-prepare"
 OUTPUT_ARCHIVE="all-offline-$(date +%Y%m%d).tar.gz"
@@ -169,10 +168,10 @@ curl -L -o "${WORK_DIR}/manifests/kube-flannel.yml" \
 # ============================================
 log_info "7. Создание установочных скриптов..."
 
-# Копируем install-all.sh (финальная версия)
+# Создаем install-all.sh (master + registry)
 cat > "${WORK_DIR}/install-all.sh" << 'INSTALL_SCRIPT'
 #!/bin/bash
-# install-all.sh - ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
+# install-all.sh - ПОЛНАЯ УСТАНОВКА MASTER УЗЛА
 # Запускать от root на целевой машине
 
 set -e
@@ -197,7 +196,7 @@ K8S_VERSION="1.33.10"
 FLANNEL_VERSION="v0.26.1"
 FLANNEL_CNI_VERSION="v1.6.0-flannel1"
 
-log_info "=== ПОЛНАЯ ОФЛАЙН УСТАНОВКА ==="
+log_info "=== ПОЛНАЯ ОФЛАЙН УСТАНОВКА (MASTER) ==="
 
 # 1. Предварительная настройка
 log_info "1. Предварительная настройка..."
@@ -218,7 +217,7 @@ EOF
 sysctl --system
 
 # 2. Определение IP адреса
-log_info "Определение IP адреса сервера..."
+log_info "2. Определение IP адреса сервера..."
 
 MASTER_IP=$(ip -4 route get 1 2>/dev/null | awk '{print $NF;exit}')
 
@@ -230,13 +229,7 @@ if [[ -z "$MASTER_IP" ]] || [[ "$MASTER_IP" == "0" ]] || [[ "$MASTER_IP" == "0.0
     MASTER_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
 fi
 
-if [[ -z "$MASTER_IP" ]] || [[ "$MASTER_IP" == "0" ]] || [[ "$MASTER_IP" == "0.0.0.0" ]]; then
-    if command -v ifconfig &> /dev/null; then
-        MASTER_IP=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
-    fi
-fi
-
-if [[ -z "$MASTER_IP" ]] || [[ "$MASTER_IP" == "0" ]] || [[ "$MASTER_IP" == "0.0.0.0" ]]; then
+if [[ -z "$MASTER_IP" ]]; then
     log_error "Не удалось определить IP адрес сервера!"
     exit 1
 fi
@@ -262,6 +255,13 @@ cd "${SCRIPT_DIR}/packages"
 rpm -ivh --force --nodeps containerd.io*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-ce*.rpm docker-ce-cli*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-buildx-plugin*.rpm docker-compose-plugin*.rpm 2>/dev/null || true
+
+# Настройка Docker для insecure registry (доступ с worker узлов)
+cat > /etc/docker/daemon.json << EOF
+{
+  "insecure-registries": ["${MASTER_IP}:5000"]
+}
+EOF
 
 systemctl enable --now docker
 sleep 5
@@ -294,7 +294,7 @@ if ! curl -s http://localhost:5000/v2/ > /dev/null; then
     log_error "Registry не запустился!"
     exit 1
 fi
-log_info "  Registry работает"
+log_info "  Registry работает на порту 5000"
 
 # 7. Загрузка образов в Registry
 log_info "7. Загрузка образов в Registry..."
@@ -303,49 +303,42 @@ if [[ -f "${SCRIPT_DIR}/images/k8s-core-images.tar" ]]; then
     docker load -i "${SCRIPT_DIR}/images/k8s-core-images.tar"
     
     for img in kube-apiserver kube-controller-manager kube-scheduler kube-proxy; do
-        docker tag registry.k8s.io/${img}:v${K8S_VERSION} ${REGISTRY}/${img}:v${K8S_VERSION}
-        docker push ${REGISTRY}/${img}:v${K8S_VERSION}
+        docker tag registry.k8s.io/${img}:v${K8S_VERSION} ${MASTER_IP}:5000/${img}:v${K8S_VERSION}
+        docker push ${MASTER_IP}:5000/${img}:v${K8S_VERSION}
         log_info "  Загружен: ${img}:v${K8S_VERSION}"
     done
     
-    docker tag registry.k8s.io/coredns/coredns:v1.12.0 ${REGISTRY}/coredns:v1.12.0
-    docker push ${REGISTRY}/coredns:v1.12.0
+    docker tag registry.k8s.io/coredns/coredns:v1.12.0 ${MASTER_IP}:5000/coredns:v1.12.0
+    docker push ${MASTER_IP}:5000/coredns:v1.12.0
     log_info "  Загружен: coredns:v1.12.0"
     
-    docker tag registry.k8s.io/pause:3.10 ${REGISTRY}/pause:3.10
-    docker push ${REGISTRY}/pause:3.10
+    docker tag registry.k8s.io/pause:3.10 ${MASTER_IP}:5000/pause:3.10
+    docker push ${MASTER_IP}:5000/pause:3.10
     log_info "  Загружен: pause:3.10"
     
-    docker tag registry.k8s.io/etcd:3.5.21-0 ${REGISTRY}/etcd:3.5.21-0
-    docker push ${REGISTRY}/etcd:3.5.21-0
+    docker tag registry.k8s.io/etcd:3.5.21-0 ${MASTER_IP}:5000/etcd:3.5.21-0
+    docker push ${MASTER_IP}:5000/etcd:3.5.21-0
     log_info "  Загружен: etcd:3.5.21-0"
-
-    docker tag ${REGISTRY}/etcd:3.5.21-0 ${REGISTRY}/etcd:3.5.24-0
-    docker push ${REGISTRY}/etcd:3.5.24-0
-    log_info "  Загружен: etcd:3.5.24-0 (доп. тег)"
 fi
 
 if [[ -f "${SCRIPT_DIR}/images/flannel-images.tar" ]]; then
     docker load -i "${SCRIPT_DIR}/images/flannel-images.tar"
-    docker tag flannel/flannel:${FLANNEL_VERSION} ${REGISTRY}/flannel:${FLANNEL_VERSION}
-    docker push ${REGISTRY}/flannel:${FLANNEL_VERSION}
+    docker tag flannel/flannel:${FLANNEL_VERSION} ${MASTER_IP}:5000/flannel:${FLANNEL_VERSION}
+    docker push ${MASTER_IP}:5000/flannel:${FLANNEL_VERSION}
     log_info "  Загружен: flannel:${FLANNEL_VERSION}"
 fi
 
 if [[ -f "${SCRIPT_DIR}/images/flannel-cni-images.tar" ]]; then
     docker load -i "${SCRIPT_DIR}/images/flannel-cni-images.tar"
-    docker tag flannel/flannel-cni-plugin:${FLANNEL_CNI_VERSION} ${REGISTRY}/flannel-cni-plugin:${FLANNEL_CNI_VERSION}
-    docker push ${REGISTRY}/flannel-cni-plugin:${FLANNEL_CNI_VERSION}
+    docker tag flannel/flannel-cni-plugin:${FLANNEL_CNI_VERSION} ${MASTER_IP}:5000/flannel-cni-plugin:${FLANNEL_CNI_VERSION}
+    docker push ${MASTER_IP}:5000/flannel-cni-plugin:${FLANNEL_CNI_VERSION}
     log_info "  Загружен: flannel-cni-plugin:${FLANNEL_CNI_VERSION}"
 fi
 
-log_info "  Все образы загружены в registry"
+log_info "  Все образы загружены в registry на ${MASTER_IP}:5000"
 
-# 8. Docker оставлен запущенным
-log_info "8. Docker оставлен запущенным (registry необходим)"
-
-# 9. Установка Kubernetes
-log_info "9. Установка Kubernetes..."
+# 8. Установка Kubernetes
+log_info "8. Установка Kubernetes..."
 cd "${SCRIPT_DIR}/packages"
 rpm -ivh --force --nodeps kubeadm*.rpm kubelet*.rpm kubectl*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps socat*.rpm conntrack*.rpm ebtables*.rpm ethtool*.rpm ipset*.rpm iptables*.rpm 2>/dev/null || true
@@ -359,12 +352,14 @@ for tgz in cni-plugins-linux-amd64-*.tgz; do
     fi
 done
 
-# 10. НАСТРОЙКА CONTAINERD
-log_info "10. Настройка containerd..."
+# 9. НАСТРОЙКА CONTAINERD
+log_info "9. Настройка containerd..."
 
 systemctl stop containerd 2>/dev/null || true
 
-cat > /etc/containerd/config.toml << 'EOF'
+# Создаем полный конфиг containerd с поддержкой HTTP registry
+mkdir -p /etc/containerd
+cat > /etc/containerd/config.toml << EOF
 version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -374,18 +369,32 @@ state = "/run/containerd"
 
 [plugins]
   [plugins."io.containerd.grpc.v1.cri"]
-    sandbox_image = "localhost:5000/pause:3.10"
+    sandbox_image = "${MASTER_IP}:5000/pause:3.10"
+    
     [plugins."io.containerd.grpc.v1.cri".containerd]
       snapshotter = "overlayfs"
       default_runtime_name = "runc"
+      
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
+        
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
           SystemdCgroup = true
+
     [plugins."io.containerd.grpc.v1.cri".registry]
       [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${MASTER_IP}:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+        
+        # Mirror для localhost:5000 - перенаправляем на мастер
         [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
-          endpoint = ["http://localhost:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+      
+      [plugins."io.containerd.grpc.v1.cri".registry.configs]
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."${MASTER_IP}:5000".tls]
+          insecure_skip_verify = true
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."localhost:5000".tls]
+          insecure_skip_verify = true
 EOF
 
 systemctl start containerd
@@ -398,13 +407,39 @@ if ! systemctl is-active --quiet containerd; then
 fi
 log_info "containerd настроен и запущен"
 
-# 11. Запуск kubelet
-log_info "11. Запуск kubelet..."
-systemctl enable --now kubelet
-sleep 5
+# 10. Настройка kubelet
+log_info "10. Настройка kubelet..."
 
-# 12. Инициализация Kubernetes
-log_info "12. Инициализация Kubernetes..."
+mkdir -p /var/lib/kubelet
+
+cat > /var/lib/kubelet/config.yaml << EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+clusterDNS:
+  - 10.96.0.10
+clusterDomain: cluster.local
+resolvConf: /etc/resolv.conf
+containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+EOF
+
+mkdir -p /etc/systemd/system/kubelet.service.d
+
+cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << EOF
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=${MASTER_IP}:5000/pause:3.10"
+ExecStart=
+ExecStart=/usr/bin/kubelet \$KUBELET_KUBECONFIG_ARGS \$KUBELET_CONFIG_ARGS \$KUBELET_EXTRA_ARGS
+EOF
+
+systemctl daemon-reload
+systemctl enable kubelet
+log_info "kubelet настроен"
+
+# 11. Инициализация Kubernetes
+log_info "11. Инициализация Kubernetes..."
 
 kubeadm reset -f 2>/dev/null || true
 rm -rf /etc/kubernetes /var/lib/etcd 2>/dev/null || true
@@ -412,18 +447,18 @@ rm -rf /etc/kubernetes /var/lib/etcd 2>/dev/null || true
 kubeadm init \
     --kubernetes-version=v${K8S_VERSION} \
     --pod-network-cidr=10.244.0.0/16 \
-    --image-repository=${REGISTRY} \
+    --image-repository=${MASTER_IP}:5000 \
     --apiserver-advertise-address=${MASTER_IP} \
     --ignore-preflight-errors=Hostname,ImagePull
 
-# 13. Настройка kubectl
-log_info "13. Настройка kubectl..."
+# 12. Настройка kubectl
+log_info "12. Настройка kubectl..."
 mkdir -p $HOME/.kube
 cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 chown $(id -u):$(id -g) $HOME/.kube/config
 
-# 14. Определяем сетевой интерфейс
-log_info "14. Определение сетевого интерфейса..."
+# 13. Определяем сетевой интерфейс
+log_info "13. Определение сетевого интерфейса..."
 
 INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 
@@ -441,13 +476,25 @@ fi
 
 log_info "  Используемый интерфейс: ${INTERFACE}"
 
-# 15. Установка Flannel
-log_info "15. Установка Flannel..."
+# 14. Установка Flannel
+log_info "14. Установка Flannel..."
 
-kubectl delete namespace kube-flannel 2>/dev/null || true
-sleep 5
+# Скачиваем и модифицируем flannel манифест
+curl -s -o /tmp/kube-flannel.yml https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml 2>/dev/null || true
 
-cat > /tmp/kube-flannel-final.yaml << EOF
+if [[ -f "/tmp/kube-flannel.yml" ]]; then
+    # Заменяем образы на локальные
+    sed -i "s|docker.io/flannel/flannel:.*|${MASTER_IP}:5000/flannel:${FLANNEL_VERSION}|g" /tmp/kube-flannel.yml
+    sed -i "s|docker.io/flannel/flannel-cni-plugin:.*|${MASTER_IP}:5000/flannel-cni-plugin:${FLANNEL_CNI_VERSION}|g" /tmp/kube-flannel.yml
+    
+    # Добавляем iface параметр
+    sed -i "/args:/a\        - --iface=${INTERFACE}" /tmp/kube-flannel.yml
+    
+    kubectl apply -f /tmp/kube-flannel.yml
+else
+    log_warn "Не удалось скачать flannel манифест, создаем вручную..."
+    
+    cat > /tmp/kube-flannel-final.yaml << EOF
 ---
 apiVersion: v1
 kind: Namespace
@@ -563,16 +610,13 @@ spec:
         effect: NoExecute
       containers:
       - name: kube-flannel
-        image: localhost:5000/flannel:v0.26.1
+        image: ${MASTER_IP}:5000/flannel:${FLANNEL_VERSION}
         command:
         - /opt/bin/flanneld
         args:
         - --ip-masq
         - --kube-subnet-mgr
-        - --kube-api-url=https://${MASTER_IP}:6443
-        - --kubeconfig-file=/etc/kubernetes/admin.conf
         - --iface=${INTERFACE}
-        - --iface-regex=${INTERFACE}
         resources:
           requests:
             cpu: "100m"
@@ -593,12 +637,9 @@ spec:
           mountPath: /run/flannel
         - name: flannel-cfg
           mountPath: /etc/kube-flannel/
-        - name: kubeconfig
-          mountPath: /etc/kubernetes
-          readOnly: true
       initContainers:
       - name: install-cni-plugin
-        image: localhost:5000/flannel-cni-plugin:v1.6.0-flannel1
+        image: ${MASTER_IP}:5000/flannel-cni-plugin:${FLANNEL_CNI_VERSION}
         command:
         - cp
         args:
@@ -609,7 +650,7 @@ spec:
         - name: cni-plugin
           mountPath: /opt/cni/bin
       - name: install-cni
-        image: localhost:5000/flannel:v0.26.1
+        image: ${MASTER_IP}:5000/flannel:${FLANNEL_VERSION}
         command:
         - cp
         args:
@@ -634,106 +675,18 @@ spec:
       - name: flannel-cfg
         configMap:
           name: kube-flannel-cfg
-      - name: kubeconfig
-        hostPath:
-          path: /etc/kubernetes
 EOF
-
-kubectl apply -f /tmp/kube-flannel-final.yaml
-
-# 16. Установка kube-proxy
-log_info "16. Установка kube-proxy..."
-
-kubectl create serviceaccount kube-proxy -n kube-system 2>/dev/null || true
-
-cat > /tmp/kube-proxy-rbac.yaml << 'EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kube-proxy
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:node-proxy
-subjects:
-- kind: ServiceAccount
-  name: kube-proxy
-  namespace: kube-system
-EOF
-kubectl apply -f /tmp/kube-proxy-rbac.yaml
-
-kubectl delete daemonset -n kube-system kube-proxy 2>/dev/null || true
-
-cat > /tmp/kube-proxy-final.yaml << 'EOF'
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: kube-proxy
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels:
-      k8s-app: kube-proxy
-  template:
-    metadata:
-      labels:
-        k8s-app: kube-proxy
-    spec:
-      hostNetwork: true
-      serviceAccountName: kube-proxy
-      containers:
-      - name: kube-proxy
-        image: localhost:5000/kube-proxy:v1.33.10
-        command:
-        - /usr/local/bin/kube-proxy
-        args:
-        - --proxy-mode=iptables
-        - --cluster-cidr=10.244.0.0/16
-        - --kubeconfig=/etc/kubernetes/admin.conf
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - mountPath: /run/xtables.lock
-          name: xtables-lock
-        - mountPath: /etc/kubernetes
-          name: kubeconfig
-          readOnly: true
-      volumes:
-      - name: xtables-lock
-        hostPath:
-          path: /run/xtables.lock
-          type: FileOrCreate
-      - name: kubeconfig
-        hostPath:
-          path: /etc/kubernetes
-      tolerations:
-      - operator: Exists
-EOF
-
-kubectl apply -f /tmp/kube-proxy-final.yaml
-
-# 17. Настройка маршрутизации
-log_info "17. Настройка маршрутизации..."
-
-if [[ -n "$INTERFACE" ]]; then
-    ip route add 10.96.0.0/12 dev ${INTERFACE} 2>/dev/null || true
+    kubectl apply -f /tmp/kube-flannel-final.yaml
 fi
 
-iptables -t nat -A OUTPUT -d 10.96.0.1 -p tcp --dport 443 -j DNAT --to-destination ${MASTER_IP}:6443 2>/dev/null || true
-iptables -t nat -A PREROUTING -d 10.96.0.1 -p tcp --dport 443 -j DNAT --to-destination ${MASTER_IP}:6443 2>/dev/null || true
-
-# 18. Снятие taints
-log_info "18. Снятие ограничений с master узла..."
+# 15. Снятие taints с master
+log_info "15. Снятие ограничений с master узла..."
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
 kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
 
-# 19. Перезапуск CoreDNS
-log_info "19. Перезапуск CoreDNS..."
-kubectl delete pods -n kube-system -l k8s-app=kube-dns 2>/dev/null || true
-
-# 20. Ожидание и проверка
-log_info "20. Ожидание запуска компонентов (120 секунд)..."
-sleep 120
+# 16. Ожидание и проверка
+log_info "16. Ожидание запуска компонентов (90 секунд)..."
+sleep 90
 
 echo ""
 log_info "=== РЕЗУЛЬТАТ ==="
@@ -743,28 +696,34 @@ kubectl get pods -n kube-system
 echo ""
 kubectl get pods -n kube-flannel 2>/dev/null || echo "Flannel namespace not found"
 
-log_info "=== УСТАНОВКА ЗАВЕРШЕНА ==="
+# 17. Сохранение join команды для worker
+log_info "17. Сохранение join команды..."
+kubeadm token create --print-join-command > /root/join-command.txt
+log_info "Join команда сохранена в /root/join-command.txt"
+
+log_info "=== УСТАНОВКА MASTER ЗАВЕРШЕНА ==="
 echo ""
 echo "Master IP: ${MASTER_IP}"
 echo "Интерфейс: ${INTERFACE}"
+echo "Registry: ${MASTER_IP}:5000"
 echo ""
-echo "Для добавления worker узлов используйте команду:"
-echo "  kubeadm token create --print-join-command"
+echo "Для добавления worker узлов:"
+echo "  1. Скопируйте архив на worker узел"
+echo "  2. Распакуйте и запустите ./install-worker.sh"
+echo "  3. Введите IP мастера: ${MASTER_IP}"
+echo "  4. Выполните join команду из /root/join-command.txt"
+echo ""
+echo "Или используйте автоматический скрипт на worker:"
+echo "  ./install-worker-auto.sh ${MASTER_IP} '\$(cat /root/join-command.txt)'"
 echo ""
 echo "Проверка работоспособности:"
 echo "  kubectl get nodes"
 echo "  kubectl get pods -n kube-system"
-echo "  kubectl get pods -n kube-flannel"
-echo ""
-echo "Для тестового запуска приложения:"
-echo "  kubectl create deployment test --image=localhost:5000/pause:3.10 --replicas=2"
-echo "  kubectl get pods"
-echo "  kubectl delete deployment test"
 INSTALL_SCRIPT
 
 chmod +x "${WORK_DIR}/install-all.sh"
 
-# Создаем install-worker.sh
+# Создаем install-worker.sh (обновленный, соответствует вашему файлу)
 cat > "${WORK_DIR}/install-worker.sh" << 'WORKER_SCRIPT'
 #!/bin/bash
 # install-worker.sh
@@ -788,10 +747,18 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REGISTRY="localhost:5000"
 K8S_VERSION="1.33.10"
 
 log_info "=== УСТАНОВКА WORKER УЗЛА ==="
+
+# ============================================
+# 0. ЗАПРОС IP МАСТЕРА
+# ============================================
+read -p "Введите IP адрес MASTER узла: " MASTER_IP
+if [[ -z "$MASTER_IP" ]]; then
+    log_error "IP адрес master узла не может быть пустым!"
+    exit 1
+fi
 
 # ============================================
 # 1. ПРЕДВАРИТЕЛЬНАЯ НАСТРОЙКА
@@ -818,13 +785,9 @@ sysctl --system
 # 2. НАСТРОЙКА HOSTS
 # ============================================
 log_info "2. Настройка /etc/hosts..."
-read -p "Введите IP адрес MASTER узла: " MASTER_IP
-
-if [[ -n "$MASTER_IP" ]]; then
-    if ! grep -q "$MASTER_IP" /etc/hosts; then
-        echo "$MASTER_IP master" >> /etc/hosts
-        log_info "Добавлена запись: $MASTER_IP master"
-    fi
+if ! grep -q "$MASTER_IP" /etc/hosts; then
+    echo "$MASTER_IP master" >> /etc/hosts
+    log_info "Добавлена запись: $MASTER_IP master"
 fi
 
 # Определяем интерфейс для worker
@@ -845,6 +808,8 @@ if [[ -f "${SCRIPT_DIR}/packages/crictl-${K8S_VERSION}-linux-amd64.tar.gz" ]]; t
     tar -xzf "${SCRIPT_DIR}/packages/crictl-${K8S_VERSION}-linux-amd64.tar.gz" -C /usr/local/bin/
     chmod +x /usr/local/bin/crictl
     log_info "  crictl установлен"
+else
+    log_warn "  crictl пакет не найден, пропускаем"
 fi
 
 # ============================================
@@ -856,6 +821,13 @@ cd "${SCRIPT_DIR}/packages"
 rpm -ivh --force --nodeps containerd.io*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-ce*.rpm docker-ce-cli*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-buildx-plugin*.rpm docker-compose-plugin*.rpm 2>/dev/null || true
+
+# Настройка Docker для insecure registry
+cat > /etc/docker/daemon.json << EOF
+{
+  "insecure-registries": ["${MASTER_IP}:5000"]
+}
+EOF
 
 systemctl enable --now docker
 sleep 5
@@ -886,7 +858,9 @@ log_info "6. Настройка containerd..."
 
 systemctl stop containerd 2>/dev/null || true
 
-cat > /etc/containerd/config.toml << 'EOF'
+# Создаем полный конфиг containerd с поддержкой HTTP registry
+mkdir -p /etc/containerd
+cat > /etc/containerd/config.toml << EOF
 version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -896,18 +870,32 @@ state = "/run/containerd"
 
 [plugins]
   [plugins."io.containerd.grpc.v1.cri"]
-    sandbox_image = "localhost:5000/pause:3.10"
+    sandbox_image = "${MASTER_IP}:5000/pause:3.10"
+    
     [plugins."io.containerd.grpc.v1.cri".containerd]
       snapshotter = "overlayfs"
       default_runtime_name = "runc"
+      
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
+        
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
           SystemdCgroup = true
+
     [plugins."io.containerd.grpc.v1.cri".registry]
       [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${MASTER_IP}:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+        
+        # Mirror для localhost:5000 - перенаправляем на мастер
         [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
-          endpoint = ["http://localhost:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+      
+      [plugins."io.containerd.grpc.v1.cri".registry.configs]
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."${MASTER_IP}:5000".tls]
+          insecure_skip_verify = true
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."localhost:5000".tls]
+          insecure_skip_verify = true
 EOF
 
 systemctl start containerd
@@ -921,39 +909,153 @@ fi
 log_info "containerd настроен и запущен"
 
 # ============================================
-# 7. ЗАПУСК KUBELET
+# 7. СОЗДАНИЕ БАЗОВОГО КОНФИГА KUBELET
 # ============================================
-log_info "7. Запуск kubelet..."
-systemctl enable --now kubelet
-sleep 5
+log_info "7. Создание базового конфига kubelet..."
+
+# Создаем директорию для конфигов kubelet
+mkdir -p /var/lib/kubelet
+
+# Создаем базовый config.yaml
+cat > /var/lib/kubelet/config.yaml << EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+clusterDNS:
+  - 10.96.0.10
+clusterDomain: cluster.local
+resolvConf: /etc/resolv.conf
+containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+EOF
+
+# Создаем директорию для drop-in файлов kubelet
+mkdir -p /etc/systemd/system/kubelet.service.d
+
+# Настройка kubelet
+cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << EOF
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=${MASTER_IP}:5000/pause:3.10"
+ExecStart=
+ExecStart=/usr/bin/kubelet \$KUBELET_KUBECONFIG_ARGS \$KUBELET_CONFIG_ARGS \$KUBELET_EXTRA_ARGS
+EOF
 
 # ============================================
-# 8. ОЖИДАНИЕ JOIN КОМАНДЫ
+# 8. НАСТРОЙКА KUBELET
 # ============================================
-log_info "8. Ожидание join команды..."
+log_info "8. Настройка kubelet..."
 
+# Проверяем наличие kubelet
+if ! command -v kubelet &> /dev/null; then
+    log_error "kubelet не установлен!"
+    exit 1
+fi
+
+# Останавливаем kubelet если запущен
+systemctl stop kubelet 2>/dev/null || true
+
+# Перезагружаем systemd
+systemctl daemon-reload
+systemctl enable kubelet
+
+# Не запускаем kubelet сразу, т.к. ему нужны конфиги от join
+log_info "kubelet настроен, но НЕ запущен (ожидает join команду)"
+
+# ============================================
+# 9. ПРОВЕРКА РАБОТЫ CONTAINERD И REGISTRY
+# ============================================
+log_info "9. Проверка доступа к registry..."
+
+# Проверяем доступ к registry
+if command -v curl &> /dev/null; then
+    if curl -s "http://${MASTER_IP}:5000/v2/_catalog" &> /dev/null; then
+        log_info "Registry доступен по адресу ${MASTER_IP}:5000"
+    else
+        log_warn "Registry не доступен, убедитесь что registry запущен на мастере"
+    fi
+fi
+
+# Проверяем загрузку pause образа
+if command -v crictl &> /dev/null; then
+    log_info "Проверка загрузки pause образа..."
+    if ! crictl pull ${MASTER_IP}:5000/pause:3.10 2>/dev/null; then
+        log_warn "Не удалось загрузить pause образ, он будет загружен при необходимости"
+    else
+        log_info "Pause образ успешно загружен"
+    fi
+fi
+
+# ============================================
+# 10. СОЗДАНИЕ HELPER СКРИПТА ДЛЯ JOIN
+# ============================================
+log_info "10. Создание helper скрипта..."
+
+cat > /root/join-cluster.sh << 'EOF'
+#!/bin/bash
+# Helper script for joining worker to cluster
+# Run this script after getting join command from master
+
+echo "=== JOIN CLUSTER ==="
+echo ""
+echo "Выполните на MASTER узле команду для получения join command:"
+echo "  kubeadm token create --print-join-command"
+echo ""
+echo "Затем скопируйте полученную команду и выполните её здесь"
+echo "Пример команды:"
+echo "  kubeadm join <MASTER_IP>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+echo ""
+echo "После присоединения проверьте статус:"
+echo "  kubectl get nodes --kubeconfig=/etc/kubernetes/kubelet.conf"
+echo "=============================================="
+EOF
+
+chmod +x /root/join-cluster.sh
+
+# ============================================
+# 11. ИТОГОВАЯ ИНФОРМАЦИЯ
+# ============================================
 echo ""
 echo "=============================================="
-echo "УСТАНОВКА WORKER УЗЛА ЗАВЕРШЕНА!"
+echo -e "${GREEN}УСТАНОВКА WORKER УЗЛА ЗАВЕРШЕНА!${NC}"
 echo "=============================================="
 echo ""
 echo "Master IP: ${MASTER_IP}"
 echo "Интерфейс: ${INTERFACE}"
 echo ""
-echo "Теперь выполните на MASTER узле:"
-echo "  kubeadm token create --print-join-command"
+echo "✅ Настройки containerd:"
+echo "   - Registry mirror: ${MASTER_IP}:5000"
+echo "   - Localhost mirror: localhost:5000 -> ${MASTER_IP}:5000"
 echo ""
-echo "Затем скопируйте полученную команду и выполните её здесь"
-echo "Пример команды:"
-echo "  kubeadm join ${MASTER_IP}:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+echo "⚠️  ВАЖНО: Все образы должны быть загружены в registry на master узле"
+echo "Проверьте наличие образов на master:"
+echo "  curl http://${MASTER_IP}:5000/v2/_catalog"
 echo ""
-echo "После присоединения проверьте на master: kubectl get nodes"
+echo "Необходимые образы для загрузки на мастер:"
+echo "  - kube-proxy:v${K8S_VERSION}"
+echo "  - pause:3.10"
+echo "  - flannel-cni-plugin:v1.6.0-flannel1"
+echo "  - flannel:v0.26.1"
+echo ""
+echo "📝 Дальнейшие действия:"
+echo "1. На MASTER узле выполните:"
+echo "   kubeadm token create --print-join-command"
+echo ""
+echo "2. На этом узле выполните join команду (или запустите /root/join-cluster.sh):"
+echo "   kubeadm join ${MASTER_IP}:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+echo ""
+echo "3. Проверьте статус узлов на мастере:"
+echo "   kubectl get nodes"
+echo ""
+echo "4. Если поды не запускаются из-за ошибок ImagePullBackOff,"
+echo "   перезапустите kubelet: systemctl restart kubelet"
+echo ""
 echo "=============================================="
 WORKER_SCRIPT
 
 chmod +x "${WORK_DIR}/install-worker.sh"
 
-# Создаем install-worker-auto.sh
+# Создаем install-worker-auto.sh (автоматическое присоединение)
 cat > "${WORK_DIR}/install-worker-auto.sh" << 'WORKER_AUTO_SCRIPT'
 #!/bin/bash
 # install-worker-auto.sh
@@ -976,10 +1078,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REGISTRY="localhost:5000"
 K8S_VERSION="1.33.10"
 
-log_info "=== УСТАНОВКА WORKER УЗЛА ==="
+log_info "=== УСТАНОВКА WORKER УЗЛА (АВТОМАТИЧЕСКАЯ) ==="
 
 # Проверка параметров
 if [[ -z "$1" ]] || [[ -z "$2" ]]; then
@@ -1057,6 +1158,13 @@ rpm -ivh --force --nodeps containerd.io*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-ce*.rpm docker-ce-cli*.rpm 2>/dev/null || true
 rpm -ivh --force --nodeps docker-buildx-plugin*.rpm docker-compose-plugin*.rpm 2>/dev/null || true
 
+# Настройка Docker для insecure registry
+cat > /etc/docker/daemon.json << EOF
+{
+  "insecure-registries": ["${MASTER_IP}:5000"]
+}
+EOF
+
 systemctl enable --now docker
 sleep 5
 log_info "Docker: $(docker --version)"
@@ -1086,7 +1194,8 @@ log_info "5. Настройка containerd..."
 
 systemctl stop containerd 2>/dev/null || true
 
-cat > /etc/containerd/config.toml << 'EOF'
+mkdir -p /etc/containerd
+cat > /etc/containerd/config.toml << EOF
 version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -1096,18 +1205,31 @@ state = "/run/containerd"
 
 [plugins]
   [plugins."io.containerd.grpc.v1.cri"]
-    sandbox_image = "localhost:5000/pause:3.10"
+    sandbox_image = "${MASTER_IP}:5000/pause:3.10"
+    
     [plugins."io.containerd.grpc.v1.cri".containerd]
       snapshotter = "overlayfs"
       default_runtime_name = "runc"
+      
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
+        
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
           SystemdCgroup = true
+
     [plugins."io.containerd.grpc.v1.cri".registry]
       [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${MASTER_IP}:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+        
         [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
-          endpoint = ["http://localhost:5000"]
+          endpoint = ["http://${MASTER_IP}:5000"]
+      
+      [plugins."io.containerd.grpc.v1.cri".registry.configs]
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."${MASTER_IP}:5000".tls]
+          insecure_skip_verify = true
+        [plugins."io.containerd.grpc.v1.cri".registry.configs."localhost:5000".tls]
+          insecure_skip_verify = true
 EOF
 
 systemctl start containerd
@@ -1121,11 +1243,37 @@ fi
 log_info "containerd настроен и запущен"
 
 # ============================================
-# 6. ЗАПУСК KUBELET
+# 6. НАСТРОЙКА KUBELET
 # ============================================
-log_info "6. Запуск kubelet..."
-systemctl enable --now kubelet
-sleep 5
+log_info "6. Настройка kubelet..."
+
+mkdir -p /var/lib/kubelet
+
+cat > /var/lib/kubelet/config.yaml << EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+clusterDNS:
+  - 10.96.0.10
+clusterDomain: cluster.local
+resolvConf: /etc/resolv.conf
+containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+EOF
+
+mkdir -p /etc/systemd/system/kubelet.service.d
+
+cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << EOF
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=${MASTER_IP}:5000/pause:3.10"
+ExecStart=
+ExecStart=/usr/bin/kubelet \$KUBELET_KUBECONFIG_ARGS \$KUBELET_CONFIG_ARGS \$KUBELET_EXTRA_ARGS
+EOF
+
+systemctl daemon-reload
+systemctl enable kubelet
+log_info "kubelet настроен"
 
 # ============================================
 # 7. ПРИСОЕДИНЕНИЕ К КЛАСТЕРУ
@@ -1283,7 +1431,23 @@ log_info ""
 log_info "Содержимое архива:"
 ls -la
 log_info ""
-log_info "Перенесите архив на целевую ВМ и выполните:"
-log_info "  tar -xzf ${OUTPUT_ARCHIVE}"
-log_info "  ./install-all.sh"
+log_info "=== ИНСТРУКЦИЯ ПО УСТАНОВКЕ ==="
+log_info ""
+log_info "1. Перенесите архив на MASTER узел и выполните:"
+log_info "   tar -xzf ${OUTPUT_ARCHIVE}"
+log_info "   ./install-all.sh"
+log_info ""
+log_info "2. После установки master, скопируйте архив на WORKER узлы"
+log_info ""
+log_info "3. На WORKER узле выполните:"
+log_info "   tar -xzf ${OUTPUT_ARCHIVE}"
+log_info "   ./install-worker.sh"
+log_info "   # Введите IP мастера и выполните join команду"
+log_info ""
+log_info "Или автоматически (рекомендуется):"
+log_info "   # На мастере получите join команду:"
+log_info "   kubeadm token create --print-join-command"
+log_info ""
+log_info "   # На worker выполните:"
+log_info "   ./install-worker-auto.sh <MASTER_IP> '<JOIN_COMMAND>'"
 log_info "=============================================="
